@@ -13,7 +13,14 @@ import sys
 import os
 import re
 import argparse
+import threading
+import itertools
+import time
+import tempfile
+import urllib.request
 from pathlib import Path
+
+VERSION = "2.2"
 
 # Fix Windows terminal encoding
 if sys.platform == "win32":
@@ -28,6 +35,39 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spinner (feedback visual durante conversão)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Spinner:
+    """Context manager que exibe um spinner animado na linha atual."""
+
+    FRAMES = ["|", "/", "-", "\\"]
+
+    def __init__(self, msg: str = "Convertendo"):
+        self.msg = msg
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+
+    def _spin(self):
+        for frame in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stdout.write(f"\r  [{frame}]  {self.msg}...")
+            sys.stdout.flush()
+            time.sleep(0.1)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args):
+        self._stop.set()
+        self._thread.join()
+        sys.stdout.write("\r" + " " * (len(self.msg) + 14) + "\r")
+        sys.stdout.flush()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +238,231 @@ def shade_table_header(row):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Table column auto-fit
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Usable page width: A4 (21cm) minus 2 × 2.54cm margins = 15.92cm
+_USABLE_WIDTH_TWIPS = int(Cm(15.92) / 635)  # 1 twip = 635 EMU
+
+
+def _auto_fit_table_columns(table, all_row_tokens, text_extractor):
+    """
+    Distribute column widths proportionally based on the longest text found
+    in each column. Ensures no column is narrower than MIN_CHARS equivalent.
+    """
+    MIN_CHARS = 6
+    num_cols = len(table.columns)
+    col_max = [MIN_CHARS] * num_cols
+
+    for row_tok in all_row_tokens:
+        if not isinstance(row_tok, dict):
+            continue
+        for col_idx, cell_tok in enumerate(row_tok.get("children", [])):
+            if col_idx >= num_cols:
+                break
+            if isinstance(cell_tok, dict):
+                text = text_extractor(cell_tok.get("children", []))
+                col_max[col_idx] = max(col_max[col_idx], len(text))
+
+    total = sum(col_max)
+    widths = [max(1, int(_USABLE_WIDTH_TWIPS * w / total)) for w in col_max]
+
+    # Fix rounding drift so widths sum exactly to usable width
+    diff = _USABLE_WIDTH_TWIPS - sum(widths)
+    widths[0] += diff
+
+    # Apply to tblGrid
+    tbl = table._tbl
+    tblGrid = tbl.find(qn("w:tblGrid"))
+    if tblGrid is None:
+        tblGrid = OxmlElement("w:tblGrid")
+        tbl.insert(2, tblGrid)
+    for gc in list(tblGrid):
+        tblGrid.remove(gc)
+    for w in widths:
+        gridCol = OxmlElement("w:gridCol")
+        gridCol.set(qn("w:w"), str(w))
+        tblGrid.append(gridCol)
+
+    # Apply to each cell
+    for row in table.rows:
+        for col_idx, cell in enumerate(row.cells):
+            if col_idx >= len(widths):
+                break
+            tc = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            tcW = tcPr.find(qn("w:tcW"))
+            if tcW is None:
+                tcW = OxmlElement("w:tcW")
+                tcPr.insert(0, tcW)
+            tcW.set(qn("w:w"), str(widths[col_idx]))
+            tcW.set(qn("w:type"), "dxa")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cover page
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_cover(md_text: str):
+    """
+    Detect a cover block at the start of the MD:
+      # Title
+      ## Subtitle          (optional)
+      *Author line*        (optional, one or more)
+      ---                  (optional separator)
+
+    Returns (cover_dict | None, remaining_md_text).
+    """
+    m = re.match(
+        r'^# ([^\n]+)\n'              # H1 title (required)
+        r'(?:## ([^\n]+)\n)?'         # H2 subtitle (optional)
+        r'(?:[ \t]*\n)*'              # blank lines
+        r'((?:\*[^\n]+\*[ \t]*\n)*)'  # italic lines (optional)
+        r'(?:[ \t]*\n)*'              # blank lines
+        r'(?:---+[ \t]*\n)?',         # separator (optional)
+        md_text,
+    )
+    if not m or not m.group(1).strip():
+        return None, md_text
+
+    title    = m.group(1).strip()
+    subtitle = m.group(2).strip() if m.group(2) else None
+    meta_raw = m.group(3) or ""
+    meta_lines = [l.strip().strip("*").strip()
+                  for l in meta_raw.splitlines() if l.strip()]
+
+    cover = {"title": title, "subtitle": subtitle, "meta_lines": meta_lines}
+    return cover, md_text[m.end():]
+
+
+def add_cover_page(doc: Document, cover: dict):
+    """Render a centered cover page and add a page break."""
+    # Vertical padding (push content towards vertical center)
+    for _ in range(8):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+
+    # ── Book title ────────────────────────────────────────────────────────────
+    title_para = doc.add_paragraph()
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_para.paragraph_format.space_after = Pt(10)
+    run = title_para.add_run(cover["title"])
+    run.bold = True
+    run.font.size = Pt(28)
+    run.font.color.rgb = RGBColor(0x1F, 0x39, 0x64)
+    run.font.name = "Calibri"
+
+    # ── Subtitle ──────────────────────────────────────────────────────────────
+    if cover.get("subtitle"):
+        sub_para = doc.add_paragraph()
+        sub_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sub_para.paragraph_format.space_after = Pt(40)
+        run = sub_para.add_run(cover["subtitle"])
+        run.italic = True
+        run.font.size = Pt(16)
+        run.font.color.rgb = RGBColor(0x2E, 0x74, 0xB5)
+        run.font.name = "Calibri"
+
+    # ── Separator line ────────────────────────────────────────────────────────
+    sep = doc.add_paragraph()
+    sep.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    sep.paragraph_format.space_after = Pt(20)
+    pPr = sep._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "12")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "2E74B5")
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+
+    # ── Author / meta lines ───────────────────────────────────────────────────
+    for line in cover.get("meta_lines", []):
+        meta_para = doc.add_paragraph()
+        meta_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        meta_para.paragraph_format.space_after = Pt(4)
+        run = meta_para.add_run(line)
+        run.font.size = Pt(13)
+        run.font.color.rgb = RGBColor(0x40, 0x40, 0x40)
+        run.font.name = "Calibri"
+
+    # ── Page break ────────────────────────────────────────────────────────────
+    doc.add_page_break()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Table of Contents
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_toc(doc: Document):
+    """Insert a Word TOC field (requires Ctrl+A, F9 in Word to populate)."""
+    title = doc.add_paragraph("Sumário", style="Heading 1")
+    title.paragraph_format.page_break_before = False
+
+    para = doc.add_paragraph()
+    run = para.add_run()
+
+    fldChar_begin = OxmlElement("w:fldChar")
+    fldChar_begin.set(qn("w:fldCharType"), "begin")
+
+    instrText = OxmlElement("w:instrText")
+    instrText.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    instrText.text = ' TOC \\o "1-3" \\h \\z \\u '
+
+    fldChar_sep = OxmlElement("w:fldChar")
+    fldChar_sep.set(qn("w:fldCharType"), "separate")
+
+    placeholder = OxmlElement("w:t")
+    placeholder.text = "(Atualize o campo: Ctrl+A → F9)"
+
+    fldChar_end = OxmlElement("w:fldChar")
+    fldChar_end.set(qn("w:fldCharType"), "end")
+
+    run._r.append(fldChar_begin)
+    run._r.append(instrText)
+    run._r.append(fldChar_sep)
+    run._r.append(placeholder)
+    run._r.append(fldChar_end)
+
+    doc.add_page_break()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Footer with page numbers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_footer_page_numbers(doc: Document):
+    """Add centred page number to footer of every section."""
+    for section in doc.sections:
+        footer = section.footer
+        footer.is_linked_to_previous = False
+
+        para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para.clear()
+
+        run = para.add_run()
+        run.font.size = Pt(10)
+        run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+        fldChar_begin = OxmlElement("w:fldChar")
+        fldChar_begin.set(qn("w:fldCharType"), "begin")
+
+        instrText = OxmlElement("w:instrText")
+        instrText.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+        instrText.text = " PAGE "
+
+        fldChar_end = OxmlElement("w:fldChar")
+        fldChar_end.set(qn("w:fldCharType"), "end")
+
+        run._r.append(fldChar_begin)
+        run._r.append(instrText)
+        run._r.append(fldChar_end)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Inline formatting parser
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -218,26 +483,6 @@ def apply_inline(para, text: str, base_bold=False, base_italic=False,
         r"|(<([^>]+)>)"           # autolink <url>
         r"|(\\\S)"                # escaped char
     )
-
-    pos = 0
-    bold = base_bold
-    italic = base_italic
-    strike = False
-    toggle_stack = []  # track open toggles
-
-    def emit_run(txt):
-        if not txt:
-            return
-        run = para.add_run(txt)
-        run.bold = bold
-        run.italic = italic
-        run.font.strike = strike
-        if base_size:
-            run.font.size = base_size
-        if base_color:
-            run.font.color.rgb = base_color
-        if font_name:
-            run.font.name = font_name
 
     i = 0
     segments = []
@@ -325,6 +570,7 @@ class DocxRenderer(mistune.BaseRenderer):
         self._list_level = 0
         self._list_type_stack = []  # "bullet" or "number"
         self._in_table_header = False
+        self._h1_count = 0          # tracks H1s for page-break logic
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -347,7 +593,6 @@ class DocxRenderer(mistune.BaseRenderer):
                 elif t == "image":
                     parts.append(tok.get("attrs", {}).get("alt", ""))
                 elif t == "raw":
-                    # strip HTML tags
                     raw = tok.get("raw", "")
                     parts.append(re.sub(r"<[^>]+>", "", raw))
             elif isinstance(tok, str):
@@ -407,21 +652,41 @@ class DocxRenderer(mistune.BaseRenderer):
                 apply_inline(para, tok, **kwargs)
 
     def _add_image_to_para(self, para, src: str, alt: str = ""):
-        """Try to add an image; fall back to alt text if not found."""
-        # Resolve relative path
-        img_path = Path(src)
-        if not img_path.is_absolute():
-            img_path = self.md_path.parent / src
-
-        if img_path.exists():
+        """Try to add an image (local or remote URL); fall back to alt text."""
+        # ── Remote URL ────────────────────────────────────────────────────────
+        if src.startswith(("http://", "https://")):
+            suffix = Path(src.split("?")[0]).suffix or ".png"
+            tmp_path = None
             try:
+                fd, tmp_name = tempfile.mkstemp(suffix=suffix)
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                urllib.request.urlretrieve(src, str(tmp_path))
                 run = para.add_run()
-                run.add_picture(str(img_path), width=Inches(5.5))
+                run.add_picture(str(tmp_path), width=Inches(5.5))
                 return
             except Exception:
                 pass
+            finally:
+                if tmp_path and tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
 
-        # URL or missing: show alt text as italic
+        # ── Local file ────────────────────────────────────────────────────────
+        else:
+            img_path = Path(src)
+            if not img_path.is_absolute():
+                img_path = self.md_path.parent / src
+            if img_path.exists():
+                try:
+                    run = para.add_run()
+                    run.add_picture(str(img_path), width=Inches(5.5))
+                    return
+                except Exception:
+                    pass
+
         display = f"[Imagem: {alt or src}]"
         run = para.add_run(display)
         run.italic = True
@@ -434,6 +699,13 @@ class DocxRenderer(mistune.BaseRenderer):
         children = token.get("children", [])
         style_name = f"Heading {min(level, 6)}"
         para = self.doc.add_paragraph(style=style_name)
+
+        # Page break before every H1 except the very first
+        if level == 1:
+            if self._h1_count > 0:
+                para.paragraph_format.page_break_before = True
+            self._h1_count += 1
+
         self._render_inline_to_para(para, children)
         return ""
 
@@ -453,9 +725,7 @@ class DocxRenderer(mistune.BaseRenderer):
     def block_code(self, token, state):
         """Fenced or indented code block."""
         raw = token.get("raw", "")
-        # Split into lines preserving empty lines
         lines = raw.split("\n")
-        # Remove trailing empty line if present
         if lines and lines[-1] == "":
             lines = lines[:-1]
 
@@ -470,17 +740,72 @@ class DocxRenderer(mistune.BaseRenderer):
         return ""
 
     def block_quote(self, token, state):
+        """
+        Render a blockquote.
+        Detects Bible-verse pattern: text followed by softline + "— Reference"
+        and renders with amber border + right-aligned reference line.
+        """
         children = token.get("children", [])
         for child in children:
-            if isinstance(child, dict):
-                ct = child.get("type", "")
-                if ct == "paragraph":
-                    para = self.doc.add_paragraph(style="Block Quote")
-                    set_left_border(para)
-                    self._render_inline_to_para(para, child.get("children", []))
-                else:
-                    # Nested block quote or other element
-                    self._render_token(child, state)
+            if not isinstance(child, dict):
+                continue
+            ct = child.get("type", "")
+            if ct != "paragraph":
+                self._render_token(child, state)
+                continue
+
+            inline = child.get("children", [])
+
+            # ── Detect citation pattern ───────────────────────────────────────
+            # Look for a softline whose next text token starts with — (em dash)
+            split_idx = None
+            for i, tok in enumerate(inline):
+                if not isinstance(tok, dict) or tok.get("type") != "softline":
+                    continue
+                for j in range(i + 1, len(inline)):
+                    nxt = inline[j]
+                    if not isinstance(nxt, dict):
+                        break
+                    nt = nxt.get("type", "")
+                    if nt == "softline":
+                        continue
+                    if nt == "text":
+                        raw = nxt.get("raw", "").strip()
+                        if raw.startswith("\u2014") or raw.startswith("—"):
+                            split_idx = i
+                    break
+                if split_idx is not None:
+                    break
+
+            if split_idx is not None:
+                # ── Quote text (amber left border, slightly smaller) ───────────
+                quote_para = self.doc.add_paragraph(style="Block Quote")
+                set_left_border(quote_para, "8B6914", size=20)
+                quote_para.paragraph_format.space_after = Pt(2)
+                self._render_inline_to_para(
+                    quote_para, inline[:split_idx],
+                    base_size=Pt(10.5),
+                    base_color=RGBColor(0x25, 0x25, 0x25),
+                )
+
+                # ── Reference line (right-aligned, gray, smaller) ─────────────
+                ref_tokens = inline[split_idx + 1:]  # skip the softline itself
+                ref_para = self.doc.add_paragraph(style="Block Quote")
+                ref_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                ref_para.paragraph_format.space_before = Pt(0)
+                ref_para.paragraph_format.space_after = Pt(10)
+                self._render_inline_to_para(
+                    ref_para, ref_tokens,
+                    base_size=Pt(10),
+                    base_italic=False,
+                    base_color=RGBColor(0x60, 0x60, 0x60),
+                )
+            else:
+                # ── Regular blockquote ────────────────────────────────────────
+                para = self.doc.add_paragraph(style="Block Quote")
+                set_left_border(para)
+                self._render_inline_to_para(para, inline)
+
         return ""
 
     def list(self, token, state):
@@ -498,7 +823,6 @@ class DocxRenderer(mistune.BaseRenderer):
         list_type = self._list_type_stack[-1] if self._list_type_stack else "bullet"
         level = self._list_level  # 1-based
 
-        # Choose style based on level and type
         if list_type == "bullet":
             style = "List Bullet" if level == 1 else f"List Bullet {min(level, 3)}"
         else:
@@ -518,12 +842,10 @@ class DocxRenderer(mistune.BaseRenderer):
                         para = self.doc.add_paragraph(style=style)
                         self._render_inline_to_para(para, child.get("children", []))
                     else:
-                        # continuation paragraph
                         p2 = self.doc.add_paragraph(style="Normal")
                         p2.paragraph_format.left_indent = Cm(level * 0.63)
                         self._render_inline_to_para(p2, child.get("children", []))
                 elif ct == "list":
-                    # nested list
                     self._render_token(child, state)
                 else:
                     self._render_token(child, state)
@@ -538,7 +860,6 @@ class DocxRenderer(mistune.BaseRenderer):
         if not children:
             return ""
 
-        # Separate head and body
         head_rows = []
         body_rows = []
         for child in children:
@@ -553,7 +874,6 @@ class DocxRenderer(mistune.BaseRenderer):
         if not head_rows and not body_rows:
             return ""
 
-        # Count columns from header
         num_cols = max(
             len(r.get("children", [])) for r in (head_rows + body_rows)
             if isinstance(r, dict)
@@ -578,7 +898,12 @@ class DocxRenderer(mistune.BaseRenderer):
         if head_rows:
             shade_table_header(table.rows[0])
 
-        # Space after table
+        _auto_fit_table_columns(
+            table,
+            head_rows + body_rows,
+            self._inline_tokens_to_text,
+        )
+
         self.doc.add_paragraph(style="Normal").paragraph_format.space_after = Pt(4)
         return ""
 
@@ -588,7 +913,6 @@ class DocxRenderer(mistune.BaseRenderer):
             if col_idx >= len(row.cells):
                 break
             cell = row.cells[col_idx]
-            # Clear default empty paragraph
             for p in cell.paragraphs:
                 p._element.getparent().remove(p._element)
 
@@ -624,11 +948,9 @@ class DocxRenderer(mistune.BaseRenderer):
     # ── Raw HTML (strip tags) ─────────────────────────────────────────────────
     def block_html(self, token, state):
         raw = token.get("raw", "")
-        # Handle <br>, <hr>
         if re.search(r"<hr\s*/?>", raw, re.I):
             add_horizontal_rule(self.doc)
             return ""
-        # Strip other HTML
         clean = re.sub(r"<[^>]+>", "", raw).strip()
         if clean:
             para = self.doc.add_paragraph(style="Normal")
@@ -654,30 +976,39 @@ def convert_md_to_docx(md_path: Path, docx_path: Path):
     # Strip YAML front matter
     md_text = re.sub(r"^---\s*\n.*?\n---\s*\n", "", md_text, flags=re.DOTALL)
 
+    # Extract cover block (title, subtitle, author) before main content
+    cover, md_body = extract_cover(md_text)
+
     doc = Document()
 
-    # Page margins (Word default: 2.54cm = 1 inch)
+    # Page setup — A4
     section = doc.sections[0]
-    section.page_width = Cm(21.0)    # A4
+    section.page_width  = Cm(21.0)
     section.page_height = Cm(29.7)
-    section.left_margin = Cm(2.54)
-    section.right_margin = Cm(2.54)
-    section.top_margin = Cm(2.54)
+    section.left_margin   = Cm(2.54)
+    section.right_margin  = Cm(2.54)
+    section.top_margin    = Cm(2.54)
     section.bottom_margin = Cm(2.54)
 
     setup_styles(doc)
+    add_footer_page_numbers(doc)
+
+    # Remove the leading empty paragraph Word always creates
+    if doc.paragraphs and doc.paragraphs[0].text == "":
+        p = doc.paragraphs[0]._element
+        p.getparent().remove(p)
+
+    # Cover page (if found)
+    if cover:
+        add_cover_page(doc, cover)
+        add_toc(doc)
 
     renderer = DocxRenderer(doc=doc, md_path=md_path)
     md_parser = mistune.create_markdown(
         renderer=renderer,
         plugins=["strikethrough", "table", "footnotes", "task_lists"],
     )
-    md_parser(md_text)
-
-    # Remove leading empty paragraph that Word always creates
-    if doc.paragraphs and doc.paragraphs[0].text == "":
-        p = doc.paragraphs[0]._element
-        p.getparent().remove(p)
+    md_parser(md_body)
 
     doc.save(str(docx_path))
 
@@ -687,26 +1018,36 @@ def convert_md_to_docx(md_path: Path, docx_path: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    print("MD to DOCX Converter by Jair Lima")
+    print("=" * 34)
+
     parser = argparse.ArgumentParser(
         description="MD to DOCX Converter by Jair Lima",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  md2docx                        # Convert all .md in current folder
-  md2docx README.md              # Convert specific file
-  md2docx README.md --force      # Overwrite existing DOCX
-  md2docx --folder /path/to/dir  # Convert all .md in another folder
+  md2docx                           # Convert all .md in current folder
+  md2docx README.md                 # Convert specific file
+  md2docx README.md --force         # Overwrite existing DOCX
+  md2docx --folder /path/to/dir     # Convert all .md in a folder
+  md2docx /path/to/dir              # Same — directory as positional arg
+  md2docx --folder . --recursive    # Include subfolders
         """,
     )
     parser.add_argument(
         "file",
         nargs="?",
-        help="Specific .md file to convert (optional)",
+        help="Specific .md file to convert, or a folder path",
     )
     parser.add_argument(
         "--folder",
         default=".",
         help="Folder to scan for .md files (default: current directory)",
+    )
+    parser.add_argument(
+        "--recursive", "-r",
+        action="store_true",
+        help="Scan subfolders recursively for .md files",
     )
     parser.add_argument(
         "--force", "-f",
@@ -717,6 +1058,11 @@ Examples:
         "--output", "-o",
         help="Output folder for DOCX files (default: same as source)",
     )
+    parser.add_argument(
+        "--version", "-v",
+        action="version",
+        version=f"MD to DOCX Converter by Jair Lima v{VERSION}",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output) if args.output else None
@@ -724,25 +1070,34 @@ Examples:
     # ── Single file mode ──────────────────────────────────────────────────────
     if args.file:
         md_path = Path(args.file).resolve()
-        if not md_path.exists():
-            print(f"[ERRO] Arquivo não encontrado: {md_path}")
-            sys.exit(1)
-        if md_path.suffix.lower() != ".md":
-            print(f"[ERRO] O arquivo deve ter extensão .md: {md_path}")
-            sys.exit(1)
 
-        out_dir = output_dir or md_path.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        docx_path = out_dir / (md_path.stem + ".docx")
+        # If argument is a directory, redirect to folder scan mode
+        if md_path.is_dir():
+            args.folder = str(md_path)
+        else:
+            if not md_path.exists():
+                print(f"[ERRO] Arquivo não encontrado: {md_path}")
+                sys.exit(1)
+            if md_path.suffix.lower() != ".md":
+                print(f"[ERRO] O arquivo deve ter extensão .md: {md_path}")
+                sys.exit(1)
 
-        if docx_path.exists() and not args.force:
-            print(f"[PULA]  {md_path.name} → já existe {docx_path.name}")
+            out_dir = output_dir or md_path.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            docx_path = out_dir / (md_path.stem + ".docx")
+
+            if docx_path.exists() and not args.force:
+                print(f"[PULA]  {md_path.name} → já existe {docx_path.name}")
+                sys.exit(0)
+
+            print(f"[CONV]  {md_path.name} → {docx_path.name}")
+            with Spinner(f"{md_path.name}"):
+                t0 = time.time()
+                convert_md_to_docx(md_path, docx_path)
+                elapsed = time.time() - t0
+            size_kb = docx_path.stat().st_size / 1024
+            print(f"[OK]    Salvo em: {docx_path}  ({elapsed:.1f}s, {size_kb:.0f} KB)")
             sys.exit(0)
-
-        print(f"[CONV]  {md_path.name} → {docx_path.name}")
-        convert_md_to_docx(md_path, docx_path)
-        print(f"[OK]    Salvo em: {docx_path}")
-        sys.exit(0)
 
     # ── Folder scan mode ──────────────────────────────────────────────────────
     folder = Path(args.folder).resolve()
@@ -750,32 +1105,49 @@ Examples:
         print(f"[ERRO] Pasta não encontrada: {folder}")
         sys.exit(1)
 
-    md_files = sorted(folder.glob("*.md"))
+    if args.recursive:
+        md_files = sorted(folder.rglob("*.md"))
+    else:
+        md_files = sorted(folder.glob("*.md"))
+
     if not md_files:
-        print(f"[INFO] Nenhum arquivo .md encontrado em: {folder}")
+        suffix = " (e subpastas)" if args.recursive else ""
+        print(f"[INFO] Nenhum arquivo .md encontrado em: {folder}{suffix}")
         sys.exit(0)
 
     converted = 0
     skipped = 0
     errors = 0
 
-    print(f"[SCAN]  {folder}")
+    rec_label = " (recursivo)" if args.recursive else ""
+    print(f"[SCAN]  {folder}{rec_label}")
     print(f"[INFO]  {len(md_files)} arquivo(s) .md encontrado(s)\n")
 
     for md_path in md_files:
-        out_dir = output_dir or md_path.parent
+        # Preserve subfolder structure when --output is set
+        if output_dir:
+            rel = md_path.relative_to(folder)
+            out_dir = output_dir / rel.parent
+        else:
+            out_dir = md_path.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         docx_path = out_dir / (md_path.stem + ".docx")
 
+        display_name = str(md_path.relative_to(folder)) if args.recursive else md_path.name
+
         if docx_path.exists() and not args.force:
-            print(f"  [PULA]  {md_path.name}")
+            print(f"  [PULA]  {display_name}")
             skipped += 1
             continue
 
         try:
-            print(f"  [CONV]  {md_path.name} → {docx_path.name}")
-            convert_md_to_docx(md_path, docx_path)
-            print(f"  [OK]    Salvo.")
+            print(f"  [CONV]  {display_name} → {docx_path.name}")
+            with Spinner(md_path.name):
+                t0 = time.time()
+                convert_md_to_docx(md_path, docx_path)
+                elapsed = time.time() - t0
+            size_kb = docx_path.stat().st_size / 1024
+            print(f"  [OK]    Salvo. ({elapsed:.1f}s, {size_kb:.0f} KB)")
             converted += 1
         except Exception as e:
             print(f"  [ERRO]  {md_path.name}: {e}")
