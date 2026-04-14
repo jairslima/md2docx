@@ -1,6 +1,6 @@
-# MD to DOCX Converter by Jair Lima
+# MD ↔ DOCX Converter by Jair Lima
 
-Conversor de arquivos Markdown (.md) para Word (.docx) com formatação completa e fiel ao padrão DOCX. Funciona como executável standalone chamável de qualquer pasta via terminal.
+Conversor universal de documentos: MD↔DOCX (bidirecional) e PDF→MD. Converte MD→DOCX com formatação completa; DOCX→MD e PDF→MD extraindo texto, headings, listas, tabelas, links e formatação inline. Funciona como executável standalone chamável de qualquer pasta via terminal.
 
 ## Stack e Dependências
 
@@ -8,6 +8,10 @@ Conversor de arquivos Markdown (.md) para Word (.docx) com formatação completa
 - **python-docx 1.2+** — geração do arquivo DOCX
 - **mistune 3.2+** — parser de Markdown (AST-based)
 - **lxml 6+** — dependência do python-docx
+- **pdfplumber 0.11+** — extração de texto/tabelas de PDF
+- **pytesseract + Tesseract 5** — OCR para PDFs escaneados
+- **pdf2image** — conversão de página PDF em imagem para OCR
+- **Pillow** — geração do ícone .ico
 - **PyInstaller 6+** — geração do executável .exe
 
 ## Estrutura de Arquivos
@@ -32,7 +36,9 @@ pip install -r requirements.txt
 
 # Executar via Python diretamente
 python md2docx.py                     # Converter todos .md da pasta atual
-python md2docx.py arquivo.md          # Converter arquivo específico
+python md2docx.py arquivo.md          # Converter MD → DOCX
+python md2docx.py relatorio.docx      # Converter DOCX → MD
+python md2docx.py artigo.pdf          # Converter PDF → MD
 python md2docx.py arquivo.md --force  # Forçar sobrescrita
 python md2docx.py "C:\pasta\"         # Converter todos .md da pasta (batch)
 
@@ -41,7 +47,9 @@ build.bat                             # Gera dist/md2docx.exe
 
 # Usar o executável (de qualquer pasta)
 md2docx                               # Converter todos .md da pasta atual
-md2docx README.md                     # Converter arquivo específico
+md2docx README.md                     # Converter MD → DOCX
+md2docx relatorio.docx                # Converter DOCX → MD
+md2docx artigo.pdf                    # Converter PDF → MD
 md2docx README.md -f                  # Forçar sobrescrita
 md2docx "C:\pasta\"                   # Batch — pasta como argumento posicional
 md2docx --folder C:\docs              # Batch — via flag
@@ -93,9 +101,17 @@ Copiar `dist/md2docx.exe` para uma pasta no PATH do sistema:
 - **Encoding UTF-8**: `sys.stdout.reconfigure(encoding='utf-8')` resolve problema com terminal Windows (cp1252).
 - **Detecção de capa por regex**: `extract_cover()` usa regex para extrair o bloco de capa sem interferir no parser mistune.
 
-## Estado Atual (2026-03-18) — v2.2
+## Estado Atual (2026-04-14) — v3.3
 
-- ✅ Conversor funcional e testado com livro real (6 arquivos .md, 0 erros)
+- ✅ **Footnotes com formatação rica** (v3.3): negrito, itálico, tachado, código inline dentro de notas de rodapé — gerados como runs XML reais, sem perda de formatação
+- ✅ **Task lists** (v3.2): `- [x]` → ☑, `- [ ]` → ☐ no DOCX
+- ✅ **Footnotes DOCX nativo** (v3.2): `[^1]` gera `<w:footnoteReference>` + `footnotes.xml` real no pacote
+- ✅ **Ícone personalizado** (v3.2): `md2docx.ico` azul escuro com "MD↔" embutido no `.exe`
+- ✅ **OCR fallback** (v3.2): páginas sem texto (PDFs escaneados) passam por Tesseract 5 automaticamente
+- ✅ **PDF → MD** implementado (v3.1): detecção de headings por tamanho de fonte, parágrafos com reflowing, tabelas como MD table, negrito/itálico por fontname
+- ✅ **Conversão inversa DOCX → MD** implementada (v3.0): headings, negrito, itálico, tachado, inline code, links, listas aninhadas, blockquotes, tabelas, blocos de código
+- ✅ Detecção automática por extensão: `.md` → DOCX, `.docx` → MD, `.pdf` → MD, `.doc` → erro orientativo
+- ✅ Conversor MD→DOCX funcional e testado com livro real (6 arquivos .md, 0 erros)
 - ✅ Executável `dist/md2docx.exe` compilado e atualizado (instalado em System32)
 - ✅ Capa automática, TOC, rodapé, quebra H1, citações bíblicas implementados
 - ✅ Batch por pasta via argumento posicional corrigido
@@ -109,9 +125,9 @@ Copiar `dist/md2docx.exe` para uma pasta no PATH do sistema:
 
 ## Próximos Passos (sugestões)
 
-- Suporte a footnotes DOCX nativo (atualmente ignorado)
-- Task lists com checkboxes (☑ / ☐)
-- Ícone customizado no .exe
+- Batch DOCX→MD e PDF→MD (`--folder` já funciona para `.md`; `.docx`/`.pdf` em lote ainda não)
+- OCR com idioma configurável (hoje usa `por+eng` fixo)
+- Batch DOCX→MD e PDF→MD (`--folder` funciona só para `.md` hoje)
 
 ## Problemas Conhecidos
 

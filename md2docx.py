@@ -20,7 +20,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-VERSION = "2.2"
+VERSION = "3.3"
 
 # Fix Windows terminal encoding
 if sys.platform == "win32":
@@ -571,6 +571,7 @@ class DocxRenderer(mistune.BaseRenderer):
         self._list_type_stack = []  # "bullet" or "number"
         self._in_table_header = False
         self._h1_count = 0          # tracks H1s for page-break logic
+        self._footnotes: list[tuple[int, list]] = []  # (id, inline_tokens)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -643,6 +644,18 @@ class DocxRenderer(mistune.BaseRenderer):
                     src = attrs.get("url", "")
                     alt = attrs.get("alt", "")
                     self._add_image_to_para(para, src, alt)
+                elif t == "footnote_ref":
+                    idx = tok.get("attrs", {}).get("index", 1)
+                    r = OxmlElement("w:r")
+                    rPr = OxmlElement("w:rPr")
+                    rStyle = OxmlElement("w:rStyle")
+                    rStyle.set(qn("w:val"), "FootnoteReference")
+                    rPr.append(rStyle)
+                    r.append(rPr)
+                    fn_ref = OxmlElement("w:footnoteReference")
+                    fn_ref.set(qn("w:id"), str(idx))
+                    r.append(fn_ref)
+                    para._p.append(r)
                 elif t == "raw":
                     raw = tok.get("raw", "")
                     clean = re.sub(r"<[^>]+>", "", raw)
@@ -823,6 +836,9 @@ class DocxRenderer(mistune.BaseRenderer):
         list_type = self._list_type_stack[-1] if self._list_type_stack else "bullet"
         level = self._list_level  # 1-based
 
+        # Task list support: checked = True/False, None = regular item
+        checked = token.get("attrs", {}).get("checked", None)
+
         if list_type == "bullet":
             style = "List Bullet" if level == 1 else f"List Bullet {min(level, 3)}"
         else:
@@ -830,16 +846,25 @@ class DocxRenderer(mistune.BaseRenderer):
 
         children = token.get("children", [])
         para = None
+        checkbox_added = False
+
+        def _add_checkbox(p):
+            nonlocal checkbox_added
+            if checked is not None and not checkbox_added:
+                p.add_run("☑ " if checked else "☐ ")
+                checkbox_added = True
 
         for child in children:
             if isinstance(child, dict):
                 ct = child.get("type", "")
                 if ct == "block_text":
                     para = self.doc.add_paragraph(style=style)
+                    _add_checkbox(para)
                     self._render_inline_to_para(para, child.get("children", []))
                 elif ct == "paragraph":
                     if para is None:
                         para = self.doc.add_paragraph(style=style)
+                        _add_checkbox(para)
                         self._render_inline_to_para(para, child.get("children", []))
                     else:
                         p2 = self.doc.add_paragraph(style="Normal")
@@ -852,8 +877,36 @@ class DocxRenderer(mistune.BaseRenderer):
             elif isinstance(child, str) and child.strip():
                 if para is None:
                     para = self.doc.add_paragraph(style=style)
+                    _add_checkbox(para)
                     apply_inline(para, child)
         return ""
+
+    def task_list_item(self, token, state):
+        """Delegate to list_item — checked attr is already in token.attrs."""
+        return self.list_item(token, state)
+
+    def footnotes(self, token, state):
+        """Collect footnote definitions (as inline token lists) for later XML attachment."""
+        for child in token.get("children", []):
+            if not isinstance(child, dict) or child.get("type") != "footnote_item":
+                continue
+            idx = child.get("attrs", {}).get("index", len(self._footnotes) + 1)
+            inline_tokens = self._collect_footnote_tokens(child)
+            self._footnotes.append((idx, inline_tokens))
+        return ""
+
+    def _collect_footnote_tokens(self, token) -> list:
+        """Collect all inline tokens from a footnote_item, joining paragraphs with a space."""
+        result = []
+        for child in token.get("children", []):
+            if not isinstance(child, dict):
+                continue
+            ct = child.get("type", "")
+            if ct in ("paragraph", "block_text"):
+                if result:
+                    result.append({"type": "softline"})
+                result.extend(child.get("children", []))
+        return result
 
     def table(self, token, state):
         children = token.get("children", [])
@@ -966,6 +1019,578 @@ class DocxRenderer(mistune.BaseRenderer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DOCX → MD helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+
+def _w(tag: str) -> str:
+    return f"{{{_NS_W}}}{tag}"
+
+
+def _attr_is_on(el, tag: str) -> bool:
+    """Return True if <w:tag> exists inside el and is NOT explicitly set to 0/false."""
+    child = el.find(_w(tag))
+    if child is None:
+        return False
+    val = child.get(_w("val"), "true")
+    return val.lower() not in ("0", "false")
+
+
+def _run_el_to_md(r_el) -> str:
+    """Convert a <w:r> XML element to inline Markdown text."""
+    rpr = r_el.find(_w("rPr"))
+    texts = r_el.findall(_w("t"))
+    text = "".join(t.text or "" for t in texts)
+    if not text:
+        return ""
+
+    bold = italic = strike = is_code = False
+
+    if rpr is not None:
+        bold   = _attr_is_on(rpr, "b")
+        italic = _attr_is_on(rpr, "i")
+        strike = _attr_is_on(rpr, "strike")
+
+        rStyle = rpr.find(_w("rStyle"))
+        if rStyle is not None and "Code" in rStyle.get(_w("val"), ""):
+            is_code = True
+
+        rFonts = rpr.find(_w("rFonts"))
+        if rFonts is not None:
+            for attr in (f"{{{_NS_W}}}ascii", f"{{{_NS_W}}}hAnsi"):
+                fname = rFonts.get(attr, "")
+                if "Courier" in fname or "Mono" in fname:
+                    is_code = True
+
+    if is_code:
+        return f"`{text}`"
+    if bold and italic:
+        return f"***{text}***"
+    if bold:
+        return f"**{text}**"
+    if italic:
+        return f"*{text}*"
+    if strike:
+        return f"~~{text}~~"
+    return text
+
+
+def _para_to_md(para) -> str:
+    """Convert a paragraph's runs and hyperlinks to inline Markdown."""
+    rels: dict = {}
+    try:
+        for rel in para.part.rels.values():
+            if "hyperlink" in rel.reltype:
+                rels[rel.rId] = rel.target_ref
+    except Exception:
+        pass
+
+    parts = []
+    for child in para._p:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+        if local == "r":
+            parts.append(_run_el_to_md(child))
+
+        elif local == "hyperlink":
+            r_id = child.get(f"{{{_NS_R}}}id")
+            url = rels.get(r_id, "#") if r_id else "#"
+            link_text = "".join(t.text or "" for t in child.iter(_w("t")))
+            if link_text:
+                parts.append(f"[{link_text}]({url})")
+
+        elif local == "ins":
+            # Tracked-change insertions — process inner runs
+            for r_el in child.findall(_w("r")):
+                parts.append(_run_el_to_md(r_el))
+
+    return "".join(parts)
+
+
+def _table_el_to_md(table) -> list[str]:
+    """Convert a python-docx Table to a list of Markdown lines."""
+    rows = table.rows
+    if not rows:
+        return []
+
+    lines = []
+    for row_idx, row in enumerate(rows):
+        cells = [c.text.replace("\n", " ").replace("|", "\\|").strip()
+                 for c in row.cells]
+        lines.append("| " + " | ".join(cells) + " |")
+        if row_idx == 0:
+            lines.append("| " + " | ".join(["---"] * len(cells)) + " |")
+    return lines
+
+
+def convert_docx_to_md(docx_path: Path, md_path: Path):
+    """Convert a DOCX file to Markdown."""
+    doc = Document(str(docx_path))
+
+    output: list[str] = []
+    code_buf: list[str] = []   # buffer for consecutive Code Block paragraphs
+
+    def flush_code():
+        if code_buf:
+            output.append("```")
+            output.extend(code_buf)
+            output.append("```")
+            output.append("")
+            code_buf.clear()
+
+    def add_blank():
+        if output and output[-1] != "":
+            output.append("")
+
+    # Build a map from element to python-docx Table object
+    table_map = {t._element: t for t in doc.tables}
+
+    for child in doc.element.body:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+
+        if local == "p":
+            # Find matching paragraph object
+            para = next((p for p in doc.paragraphs if p._element is child), None)
+            if para is None:
+                continue
+
+            style = para.style.name
+            raw_text = para.text
+
+            # ── Code block paragraph ──────────────────────────────────────────
+            if style == "Code Block":
+                code_buf.append(raw_text)
+                continue
+
+            flush_code()
+
+            if not raw_text.strip():
+                add_blank()
+                continue
+
+            md_text = _para_to_md(para)
+
+            # ── Headings ──────────────────────────────────────────────────────
+            if re.match(r"Heading \d", style):
+                level = int(style[-1])
+                add_blank()
+                output.append("#" * level + " " + md_text)
+                output.append("")
+
+            # ── Bullet list ───────────────────────────────────────────────────
+            elif style.startswith("List Bullet"):
+                suffix = style.replace("List Bullet", "").strip()
+                level  = int(suffix) if suffix.isdigit() else 1
+                output.append("  " * (level - 1) + "- " + md_text)
+
+            # ── Numbered list ─────────────────────────────────────────────────
+            elif style.startswith("List Number"):
+                suffix = style.replace("List Number", "").strip()
+                level  = int(suffix) if suffix.isdigit() else 1
+                output.append("  " * (level - 1) + "1. " + md_text)
+
+            # ── Blockquote ────────────────────────────────────────────────────
+            elif style in ("Block Quote", "Quote"):
+                output.append("> " + md_text)
+
+            # ── Normal / everything else ──────────────────────────────────────
+            else:
+                output.append(md_text)
+
+        elif local == "tbl":
+            flush_code()
+            table = table_map.get(child)
+            if table is not None:
+                add_blank()
+                output.extend(_table_el_to_md(table))
+                output.append("")
+
+        elif local == "sectPr":
+            pass  # section properties — ignore
+
+    flush_code()
+
+    # Remove trailing blank lines
+    while output and output[-1] == "":
+        output.pop()
+
+    md_path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF → MD conversion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _heading_level_from_size(size: float, body_size: float) -> int:
+    """Return Markdown heading level (1-4) or 0 for body text."""
+    if body_size <= 0:
+        return 0
+    ratio = size / body_size
+    if ratio >= 1.8:
+        return 1
+    if ratio >= 1.4:
+        return 2
+    if ratio >= 1.2:
+        return 3
+    if ratio >= 1.1:
+        return 4
+    return 0
+
+
+def _line_chars_to_text(chars: list) -> str:
+    """Join a sorted list of char dicts into a string, inserting spaces at word gaps."""
+    if not chars:
+        return ""
+    sorted_chars = sorted(chars, key=lambda c: c.get("x0", 0))
+    result = []
+    prev_x1 = None
+    for ch in sorted_chars:
+        text = ch.get("text", "")
+        x0 = ch.get("x0", 0)
+        size = float(ch.get("size", 10))
+        if prev_x1 is not None and x0 - prev_x1 > size * 0.25:
+            result.append(" ")
+        result.append(text)
+        prev_x1 = ch.get("x1", x0 + size * 0.5)
+    return "".join(result).strip()
+
+
+def _ocr_page_to_text(pdf_path: Path, page_number: int) -> str:
+    """
+    Run Tesseract OCR on a single PDF page (1-based index).
+    Returns extracted plain text, or empty string on failure.
+    Requires: pytesseract + tesseract binary + pdf2image + poppler.
+    """
+    try:
+        import pytesseract
+        from pdf2image import convert_from_path
+        images = convert_from_path(
+            str(pdf_path),
+            dpi=300,
+            first_page=page_number,
+            last_page=page_number,
+        )
+        if not images:
+            return ""
+        text = pytesseract.image_to_string(images[0], lang="por+eng")
+        return text.strip()
+    except Exception:
+        return ""
+
+
+def _page_has_text(page) -> bool:
+    """Return True if pdfplumber page contains meaningful extractable text."""
+    chars = page.chars
+    return len(chars) > 20  # threshold: at least 20 glyphs
+
+
+def convert_pdf_to_md(pdf_path: Path, md_path: Path):
+    """Convert a PDF file to Markdown using pdfplumber (with OCR fallback)."""
+    try:
+        import pdfplumber
+    except ImportError:
+        print("[ERRO] pdfplumber não instalado. Execute: pip install pdfplumber")
+        sys.exit(1)
+
+    all_output: list[str] = []
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+
+        # ── Pass 1: determine body font size (most frequent across all pages) ──
+        size_freq: dict[float, int] = {}
+        for page in pdf.pages:
+            for ch in page.chars:
+                s = round(float(ch.get("size", 12)), 1)
+                size_freq[s] = size_freq.get(s, 0) + 1
+        body_size = max(size_freq, key=size_freq.get) if size_freq else 12.0
+
+        # ── Pass 2: page-by-page extraction ───────────────────────────────────
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            page_out: list[str] = []
+
+            # ── OCR fallback for scanned/image-only pages ─────────────────────
+            if not _page_has_text(page):
+                ocr_text = _ocr_page_to_text(pdf_path, page_idx)
+                if ocr_text:
+                    for line in ocr_text.splitlines():
+                        line = line.strip()
+                        if line:
+                            page_out.append(line)
+                        elif page_out and page_out[-1] != "":
+                            page_out.append("")
+                all_output.extend(page_out)
+                all_output.append("")
+                continue
+
+            # Locate tables and pre-render them as Markdown
+            try:
+                table_objs = page.find_tables()
+            except Exception:
+                table_objs = []
+
+            table_bboxes = [t.bbox for t in table_objs]  # (x0, top, x1, bottom)
+
+            tables_by_y: dict[float, list[str]] = {}
+            for t_obj in table_objs:
+                data = t_obj.extract()
+                if not data:
+                    continue
+                md_rows: list[str] = []
+                for row_idx, row in enumerate(data):
+                    cells = [
+                        str(c or "").replace("\n", " ").replace("|", "\\|").strip()
+                        for c in row
+                    ]
+                    md_rows.append("| " + " | ".join(cells) + " |")
+                    if row_idx == 0:
+                        md_rows.append("| " + " | ".join(["---"] * len(cells)) + " |")
+                tables_by_y[t_obj.bbox[1]] = md_rows
+
+            # Filter chars that fall inside table bounding boxes
+            def _in_table(ch) -> bool:
+                cx0, ctop = ch.get("x0", 0), ch.get("top", 0)
+                cx1, cbot = ch.get("x1", 0), ch.get("bottom", 0)
+                for (tx0, ttop, tx1, tbot) in table_bboxes:
+                    if cx0 >= tx0 - 2 and cx1 <= tx1 + 2 and ctop >= ttop - 2 and cbot <= tbot + 2:
+                        return True
+                return False
+
+            text_chars = [ch for ch in page.chars if not _in_table(ch)]
+
+            # Group chars into visual lines (tolerance ±2 pt on y)
+            raw_lines: dict[float, list] = {}
+            for ch in text_chars:
+                top = ch.get("top", 0)
+                matched = next((k for k in raw_lines if abs(k - top) <= 2), None)
+                if matched is None:
+                    raw_lines[top] = []
+                    matched = top
+                raw_lines[matched].append(ch)
+
+            sorted_lines = sorted(raw_lines.items())  # ascending by y
+
+            # Group consecutive lines into paragraphs:
+            # same dominant font size + gap ≤ 1.6× font size → same paragraph
+            paragraphs: list[list[tuple[float, list]]] = []
+            for line_y, chars in sorted_lines:
+                if not chars:
+                    continue
+                sizes = [float(ch.get("size", body_size)) for ch in chars]
+                dom_size = max(set(sizes), key=sizes.count)
+
+                merge = False
+                if paragraphs:
+                    last_line_y, last_chars = paragraphs[-1][-1]
+                    if last_chars:
+                        lsizes = [float(ch.get("size", body_size)) for ch in last_chars]
+                        last_size = max(set(lsizes), key=lsizes.count)
+                        gap = line_y - last_line_y
+                        if abs(dom_size - last_size) < 1.5 and gap <= last_size * 1.6:
+                            merge = True
+
+                if merge:
+                    paragraphs[-1].append((line_y, chars))
+                else:
+                    paragraphs.append([(line_y, chars)])
+
+            # Render paragraphs, interleaving tables at their y positions
+            table_ys = sorted(tables_by_y.keys())
+            table_idx = 0
+
+            for para_lines in paragraphs:
+                para_y = para_lines[0][0]
+
+                # Insert tables that appear above this paragraph
+                while table_idx < len(table_ys) and table_ys[table_idx] < para_y:
+                    page_out.append("")
+                    page_out.extend(tables_by_y[table_ys[table_idx]])
+                    page_out.append("")
+                    table_idx += 1
+
+                # Build paragraph text by joining each line
+                line_texts = [_line_chars_to_text(chars) for _, chars in para_lines]
+                text = " ".join(t for t in line_texts if t)
+                if not text:
+                    continue
+
+                # Determine dominant attributes across the whole paragraph
+                all_chars = [ch for _, chars in para_lines for ch in chars]
+                sizes = [float(ch.get("size", body_size)) for ch in all_chars]
+                dom_size = max(set(sizes), key=sizes.count)
+                fontnames = [ch.get("fontname", "") for ch in all_chars]
+                is_bold = any("Bold" in fn or "bold" in fn for fn in fontnames)
+                is_italic = any(
+                    "Italic" in fn or "Oblique" in fn or "italic" in fn
+                    for fn in fontnames
+                )
+
+                heading = _heading_level_from_size(dom_size, body_size)
+
+                if heading > 0:
+                    page_out.append("")
+                    page_out.append("#" * heading + " " + text)
+                    page_out.append("")
+                elif is_bold and not is_italic:
+                    page_out.append(f"**{text}**")
+                else:
+                    if is_italic:
+                        page_out.append(f"*{text}*")
+                    else:
+                        page_out.append(text)
+
+            # Append remaining tables at page bottom
+            while table_idx < len(table_ys):
+                page_out.append("")
+                page_out.extend(tables_by_y[table_ys[table_idx]])
+                page_out.append("")
+                table_idx += 1
+
+            all_output.extend(page_out)
+            all_output.append("")  # visual separator between pages
+
+    # Collapse multiple consecutive blank lines into one
+    cleaned: list[str] = []
+    for line in all_output:
+        if line == "" and cleaned and cleaned[-1] == "":
+            continue
+        cleaned.append(line)
+
+    while cleaned and cleaned[-1] == "":
+        cleaned.pop()
+
+    md_path.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOCX footnote attachment (XML level — python-docx has no native support)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_W_NS  = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+_FOOTNOTES_CT  = "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"
+_FOOTNOTES_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
+_FOOTNOTES_URI = "/word/footnotes.xml"
+
+
+def _fn_el(tag: str, parent=None, attribs: dict | None = None):
+    """Create a w:-namespaced element, optionally appending it to parent."""
+    el = OxmlElement(f"w:{tag}")
+    if attribs:
+        for k, v in attribs.items():
+            el.set(qn(f"w:{k}"), v)
+    if parent is not None:
+        parent.append(el)
+    return el
+
+
+def _render_inline_tokens_to_runs(renderer: "DocxRenderer", tokens: list) -> list:
+    """
+    Render inline tokens via a throw-away paragraph and return deep-copied XML elements.
+    Hyperlinks are flattened to plain runs to avoid cross-part relationship issues.
+    """
+    import copy
+    from docx import Document as _TmpDoc
+
+    tmp_doc  = _TmpDoc()
+    tmp_para = tmp_doc.add_paragraph()
+    renderer._render_inline_to_para(tmp_para, tokens)
+
+    runs = []
+    for child in tmp_para._p:
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if local == "r":
+            runs.append(copy.deepcopy(child))
+        elif local == "hyperlink":
+            # Flatten hyperlink runs to avoid cross-part rels
+            for r_el in child.findall(_w("r")):
+                runs.append(copy.deepcopy(r_el))
+    return runs
+
+
+def _build_footnotes_element(footnotes: list[tuple[int, list]]):
+    """Build the <w:footnotes> lxml element tree with rich run content."""
+    from lxml import etree
+
+    root = etree.Element(
+        f"{{{_W_NS}}}footnotes",
+        nsmap={
+            "w":   _W_NS,
+            "xml": _XML_NS,
+        },
+    )
+
+    # Required separator stubs (id -1 and 0)
+    for fn_id, fn_type, sep_tag in [
+        ("-1", "separator",             "separator"),
+        ("0",  "continuationSeparator", "continuationSeparator"),
+    ]:
+        fn_el  = etree.SubElement(root, f"{{{_W_NS}}}footnote")
+        fn_el.set(f"{{{_W_NS}}}type", fn_type)
+        fn_el.set(f"{{{_W_NS}}}id",   fn_id)
+        p      = etree.SubElement(fn_el, f"{{{_W_NS}}}p")
+        pPr    = etree.SubElement(p, f"{{{_W_NS}}}pPr")
+        sp     = etree.SubElement(pPr, f"{{{_W_NS}}}spacing")
+        sp.set(f"{{{_W_NS}}}after",    "0")
+        sp.set(f"{{{_W_NS}}}line",     "240")
+        sp.set(f"{{{_W_NS}}}lineRule", "auto")
+        r      = etree.SubElement(p, f"{{{_W_NS}}}r")
+        etree.SubElement(r, f"{{{_W_NS}}}{sep_tag}")
+
+    # Actual footnotes — fn_runs is a list of pre-rendered lxml <w:r> elements
+    for fn_id, fn_runs in footnotes:
+        fn_el  = etree.SubElement(root, f"{{{_W_NS}}}footnote")
+        fn_el.set(f"{{{_W_NS}}}id", str(fn_id))
+        p      = etree.SubElement(fn_el, f"{{{_W_NS}}}p")
+        pPr    = etree.SubElement(p, f"{{{_W_NS}}}pPr")
+        pStyle = etree.SubElement(pPr, f"{{{_W_NS}}}pStyle")
+        pStyle.set(f"{{{_W_NS}}}val", "FootnoteText")
+
+        # Footnote mark (superscript anchor inside footnote paragraph)
+        r_mark   = etree.SubElement(p, f"{{{_W_NS}}}r")
+        rPr_m    = etree.SubElement(r_mark, f"{{{_W_NS}}}rPr")
+        rStyle_m = etree.SubElement(rPr_m, f"{{{_W_NS}}}rStyle")
+        rStyle_m.set(f"{{{_W_NS}}}val", "FootnoteReference")
+        etree.SubElement(r_mark, f"{{{_W_NS}}}footnoteRef")
+
+        # Leading space run (conventional)
+        r_sp = etree.SubElement(p, f"{{{_W_NS}}}r")
+        t_sp = etree.SubElement(r_sp, f"{{{_W_NS}}}t")
+        t_sp.set(f"{{{_XML_NS}}}space", "preserve")
+        t_sp.text = " "
+
+        # Rich content runs
+        for run_el in fn_runs:
+            p.append(run_el)
+
+    return root
+
+
+def _attach_footnotes(doc: Document, footnotes_raw: list[tuple[int, list]],
+                      renderer: "DocxRenderer"):
+    """Pre-render inline tokens, build footnotes.xml, and relate it to the document."""
+    if not footnotes_raw:
+        return
+
+    from docx.opc.part import XmlPart
+    from docx.opc.packuri import PackURI
+
+    # Convert inline tokens → pre-rendered XML run elements
+    footnotes_rendered = [
+        (fn_id, _render_inline_tokens_to_runs(renderer, tokens))
+        for fn_id, tokens in footnotes_raw
+    ]
+
+    fn_element = _build_footnotes_element(footnotes_rendered)
+    part_uri   = PackURI(_FOOTNOTES_URI)
+    fn_part    = XmlPart(part_uri, _FOOTNOTES_CT, fn_element, doc.part.package)
+    doc.part.relate_to(fn_part, _FOOTNOTES_REL)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Core conversion function
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1010,6 +1635,9 @@ def convert_md_to_docx(md_path: Path, docx_path: Path):
     )
     md_parser(md_body)
 
+    if renderer._footnotes:
+        _attach_footnotes(doc, renderer._footnotes, renderer)
+
     doc.save(str(docx_path))
 
 
@@ -1018,17 +1646,19 @@ def convert_md_to_docx(md_path: Path, docx_path: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("MD to DOCX Converter by Jair Lima")
+    print("MD ↔ DOCX Converter by Jair Lima")
     print("=" * 34)
 
     parser = argparse.ArgumentParser(
-        description="MD to DOCX Converter by Jair Lima",
+        description="MD ↔ DOCX / PDF → MD Converter by Jair Lima",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   md2docx                           # Convert all .md in current folder
-  md2docx README.md                 # Convert specific file
-  md2docx README.md --force         # Overwrite existing DOCX
+  md2docx README.md                 # Convert .md → .docx
+  md2docx relatorio.docx            # Convert .docx → .md
+  md2docx artigo.pdf                # Convert .pdf  → .md
+  md2docx README.md --force         # Overwrite existing file
   md2docx --folder /path/to/dir     # Convert all .md in a folder
   md2docx /path/to/dir              # Same — directory as positional arg
   md2docx --folder . --recursive    # Include subfolders
@@ -1069,19 +1699,66 @@ Examples:
 
     # ── Single file mode ──────────────────────────────────────────────────────
     if args.file:
-        md_path = Path(args.file).resolve()
+        src_path = Path(args.file).resolve()
 
         # If argument is a directory, redirect to folder scan mode
-        if md_path.is_dir():
-            args.folder = str(md_path)
+        if src_path.is_dir():
+            args.folder = str(src_path)
         else:
-            if not md_path.exists():
-                print(f"[ERRO] Arquivo não encontrado: {md_path}")
-                sys.exit(1)
-            if md_path.suffix.lower() != ".md":
-                print(f"[ERRO] O arquivo deve ter extensão .md: {md_path}")
+            if not src_path.exists():
+                print(f"[ERRO] Arquivo não encontrado: {src_path}")
                 sys.exit(1)
 
+            ext = src_path.suffix.lower()
+
+            # ── PDF → MD ──────────────────────────────────────────────────────
+            if ext == ".pdf":
+                out_dir = output_dir or src_path.parent
+                out_dir.mkdir(parents=True, exist_ok=True)
+                md_out = out_dir / (src_path.stem + ".md")
+
+                if md_out.exists() and not args.force:
+                    print(f"[PULA]  {src_path.name} → já existe {md_out.name}")
+                    sys.exit(0)
+
+                print(f"[CONV]  {src_path.name} → {md_out.name}  (PDF → MD)")
+                with Spinner(f"{src_path.name}"):
+                    t0 = time.time()
+                    convert_pdf_to_md(src_path, md_out)
+                    elapsed = time.time() - t0
+                size_kb = md_out.stat().st_size / 1024
+                print(f"[OK]    Salvo em: {md_out}  ({elapsed:.1f}s, {size_kb:.0f} KB)")
+                sys.exit(0)
+
+            # ── DOCX/DOC → MD (modo inverso) ──────────────────────────────────
+            if ext in (".docx", ".doc"):
+                if ext == ".doc":
+                    print(f"[ERRO] Arquivos .doc legados não são suportados. Abra no Word e salve como .docx.")
+                    sys.exit(1)
+
+                out_dir = output_dir or src_path.parent
+                out_dir.mkdir(parents=True, exist_ok=True)
+                md_out = out_dir / (src_path.stem + ".md")
+
+                if md_out.exists() and not args.force:
+                    print(f"[PULA]  {src_path.name} → já existe {md_out.name}")
+                    sys.exit(0)
+
+                print(f"[CONV]  {src_path.name} → {md_out.name}  (DOCX → MD)")
+                with Spinner(f"{src_path.name}"):
+                    t0 = time.time()
+                    convert_docx_to_md(src_path, md_out)
+                    elapsed = time.time() - t0
+                size_kb = md_out.stat().st_size / 1024
+                print(f"[OK]    Salvo em: {md_out}  ({elapsed:.1f}s, {size_kb:.0f} KB)")
+                sys.exit(0)
+
+            # ── MD → DOCX (modo normal) ────────────────────────────────────────
+            if ext != ".md":
+                print(f"[ERRO] Extensão não suportada: '{ext}'. Use .md, .docx, .pdf ou uma pasta.")
+                sys.exit(1)
+
+            md_path = src_path
             out_dir = output_dir or md_path.parent
             out_dir.mkdir(parents=True, exist_ok=True)
             docx_path = out_dir / (md_path.stem + ".docx")
