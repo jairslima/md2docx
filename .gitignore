@@ -17,3 +17,13 @@ Thumbs.db
 
 # Test outputs (keep .md, ignore generated .docx)
 test_sample.docx
+
+# Seguranca — auditoria 2026-05-28
+.env
+*.key
+secrets.*
+*.pkl
+*.pem
+credentials.*
+*.p12
+*.pfx
