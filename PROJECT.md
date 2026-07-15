@@ -19,6 +19,7 @@ Conversor universal de documentos: MD↔DOCX (bidirecional) e PDF→MD. Converte
 ```
 ConversorMD2DocX/
 ├── md2docx.py          # Script principal (conversor + CLI)
+├── test_roundtrip.py   # Teste de regressão (round-trip MD↔DOCX + numeração de lista)
 ├── build.bat           # Script de build para gerar o .exe
 ├── requirements.txt    # Dependências Python
 ├── test_sample.md      # Arquivo MD de teste com todos os elementos
@@ -33,6 +34,9 @@ ConversorMD2DocX/
 ```bash
 # Instalar dependências
 pip install -r requirements.txt
+
+# Rodar o teste de regressão (rodar antes de cada build/commit)
+python test_roundtrip.py
 
 # Executar via Python diretamente
 python md2docx.py                     # Converter todos .md da pasta atual
@@ -104,6 +108,7 @@ Copiar `dist/md2docx.exe` para uma pasta no PATH do sistema:
 
 ## Estado Atual (2026-07-15) — v3.5
 
+- ✅ **Teste de regressão** (`test_roundtrip.py`, v3.5): valida round-trip MD→DOCX→MD de negrito/itálico/negrito+itálico/tachado/código, cabeçalho de tabela não duplicado, e numeração de lista reiniciando em 1 por lista (incluindo lista aninhada). Rodar antes de cada build/commit — pegou as 12 regressões dos 3 bugs abaixo quando testado contra o código pré-correção.
 - 🐛 **Correção crítica: listas numeradas cresciam sem reiniciar entre capítulos/seções** (v3.5): cada item de lista numerada usava apenas o estilo Word `"List Number"`, que compartilha uma numeração global — em manuscritos com muitas listas separadas, os números só cresciam (chegando a passar de 100 em vez de reiniciar em 1 a cada lista). Corrigido: cada bloco `<list>` do Markdown agora ganha sua própria instância de numeração (`w:numId` dedicado, apontando para o mesmo `abstractNum` do estilo), então cada lista reinicia em 1 independentemente das outras. Listas aninhadas continuam funcionando normalmente (cada nível de aninhamento recebe seu próprio `numId`).
 - ✅ **`--output` com nome de arquivo** (v3.4): `md2docx arquivo.md --output livro.docx` agora grava diretamente no caminho especificado. Antes criava uma pasta `livro.docx/` com o arquivo dentro; agora detecta extensão `.docx` e trata como arquivo de destino.
 - 🐛 **Correção crítica: itálico e tachado sumiam no MD→DOCX** (v3.4): o mistune 3 usa os tipos de token `emphasis` e `strikethrough` (não `em`/`del` como nas versões antigas). O renderer só tratava `em`/`del`, então texto em *itálico*, ***negrito+itálico*** e ~~tachado~~ era silenciosamente descartado ao gerar o DOCX. Corrigido para aceitar ambos os nomes de token.
@@ -132,7 +137,8 @@ Copiar `dist/md2docx.exe` para uma pasta no PATH do sistema:
 
 - Batch DOCX→MD e PDF→MD (`--folder` já funciona para `.md`; `.docx`/`.pdf` em lote ainda não)
 - OCR com idioma configurável (hoje usa `por+eng` fixo)
-- Batch DOCX→MD e PDF→MD (`--folder` funciona só para `.md` hoje)
+- **Auditar DOCX já gerados por versões antigas (≤ v3.3)**: livros/documentos convertidos antes da correção da v3.4/v3.5 podem ter itálico, tachado ou numeração de lista corrompidos silenciosamente. Verificar pelo menos os manuscritos técnicos gerados nesse período.
+- `--output arquivo.md` no modo DOCX→MD ainda cria uma pasta com esse nome em vez de gravar o arquivo diretamente (só o modo MD→DOCX foi corrigido na v3.4); pequena inconsistência a alinhar.
 
 ## Problemas Conhecidos
 
