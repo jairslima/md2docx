@@ -144,3 +144,13 @@ Copiar `dist/md2docx.exe` para uma pasta no PATH do sistema:
 
 - TOC requer atualização manual no Word (Ctrl+A → F9) — limitação do formato DOCX
 - Imagens por URL dependem de conexão ativa; falha silenciosa exibe texto de alt
+
+## Publicação winget
+
+- **PackageIdentifier:** `JairLima.MD2DOCX`
+- **Manifesto:** `manifests/j/JairLima/MD2DOCX/3.5/` (schema 1.6.0), `InstallerType: portable` (é CLI standalone, sem instalador — winget copia o exe e adiciona `md2docx` ao PATH). Validado com `winget validate` e testado com `winget install --manifest` (instalação silenciosa real, com sucesso).
+- **Release usada como fonte:** https://github.com/jairslima/md2docx/releases/tag/v3.5
+- **Fork:** https://github.com/jairslima/winget-pkgs (branch `JairLima.MD2DOCX-3.5`)
+- **PR:** https://github.com/microsoft/winget-pkgs/pull/402819 (aberto 2026-07-15). CLA já reconhecido automaticamente pela organização (mesmo publisher do PR do MDWord), sem precisar comentar `agree` de novo.
+- Monitorado pela mesma rotina em nuvem que acompanha o PR do MDWord (`trig_01TktfHtDB789KAb9M3esNsj`, 2x/dia) — renomeada para cobrir os dois PRs.
+- Nota: `Scope: user` não é válido para `InstallerType: portable` (gera warning no `winget validate`) — omitir o campo Scope inteiramente para pacotes portable.
