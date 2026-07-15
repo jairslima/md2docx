@@ -20,7 +20,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-VERSION = "3.3"
+VERSION = "3.5"
 
 # Fix Windows terminal encoding
 if sys.platform == "win32":
@@ -572,6 +572,9 @@ class DocxRenderer(mistune.BaseRenderer):
         self._in_table_header = False
         self._h1_count = 0          # tracks H1s for page-break logic
         self._footnotes: list[tuple[int, list]] = []  # (id, inline_tokens)
+        self._numid_stack: list[str | None] = []   # active numId per ordered <list>, so each restarts at 1
+        self._numbering_abstract_ids: dict[str, str] = {}  # style name -> abstractNumId cache
+        self._next_num_id: int | None = None
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -583,7 +586,7 @@ class DocxRenderer(mistune.BaseRenderer):
                 t = tok.get("type", "")
                 if t == "text":
                     parts.append(tok.get("raw", ""))
-                elif t in ("strong", "em", "codespan", "del"):
+                elif t in ("strong", "emphasis", "em", "codespan", "del", "strikethrough"):
                     parts.append(self._inline_tokens_to_text(tok.get("children", [])))
                 elif t == "softline":
                     parts.append(" ")
@@ -614,10 +617,10 @@ class DocxRenderer(mistune.BaseRenderer):
                 elif t == "strong":
                     self._render_inline_to_para(para, tok.get("children", []),
                                                  base_bold=True, **{k: v for k, v in kwargs.items() if k != "base_bold"})
-                elif t == "em":
+                elif t in ("em", "emphasis"):
                     self._render_inline_to_para(para, tok.get("children", []),
                                                  base_italic=True, **{k: v for k, v in kwargs.items() if k != "base_italic"})
-                elif t == "del":
+                elif t in ("del", "strikethrough"):
                     child_tokens = tok.get("children", [])
                     for ct in child_tokens:
                         if isinstance(ct, dict) and ct.get("type") == "text":
@@ -821,15 +824,71 @@ class DocxRenderer(mistune.BaseRenderer):
 
         return ""
 
+    def _find_abstract_num_id(self, style_name: str) -> str | None:
+        """Find the abstractNumId whose level is linked to a given paragraph style."""
+        if style_name in self._numbering_abstract_ids:
+            return self._numbering_abstract_ids[style_name]
+        numbering = self.doc.part.numbering_part.element
+        for abstract_num in numbering.findall(qn("w:abstractNum")):
+            for lvl in abstract_num.findall(qn("w:lvl")):
+                pStyle = lvl.find(qn("w:pStyle"))
+                if pStyle is not None and pStyle.get(qn("w:val")) == style_name:
+                    abstract_id = abstract_num.get(qn("w:abstractNumId"))
+                    self._numbering_abstract_ids[style_name] = abstract_id
+                    return abstract_id
+        return None
+
+    def _new_ordered_num_id(self, level: int) -> str | None:
+        """Create a fresh <w:num> numbering instance so this ordered list restarts at 1,
+        independent from every other ordered list in the document (Word otherwise shares
+        a single counter across all paragraphs using the same 'List Number' style)."""
+        style_name = "ListNumber" if level == 1 else f"ListNumber{min(level, 3)}"
+        abstract_id = self._find_abstract_num_id(style_name)
+        if abstract_id is None:
+            return None
+        numbering = self.doc.part.numbering_part.element
+        if self._next_num_id is None:
+            existing = [int(n.get(qn("w:numId"))) for n in numbering.findall(qn("w:num"))]
+            self._next_num_id = (max(existing) + 1) if existing else 1
+        num_id = self._next_num_id
+        self._next_num_id += 1
+        num_el = OxmlElement("w:num")
+        num_el.set(qn("w:numId"), str(num_id))
+        abstract_ref = OxmlElement("w:abstractNumId")
+        abstract_ref.set(qn("w:val"), abstract_id)
+        num_el.append(abstract_ref)
+        numbering.append(num_el)
+        return str(num_id)
+
+    def _apply_num_id(self, para) -> None:
+        """Attach the active ordered-list numId to a list-item paragraph as an explicit
+        override, so it uses its own numbering instance instead of the style's shared one."""
+        if self._list_type_stack and self._list_type_stack[-1] == "number" and self._numid_stack:
+            num_id = self._numid_stack[-1]
+            if num_id is not None:
+                pPr = para._p.get_or_add_pPr()
+                numPr = OxmlElement("w:numPr")
+                ilvl = OxmlElement("w:ilvl")
+                ilvl.set(qn("w:val"), "0")
+                numIdEl = OxmlElement("w:numId")
+                numIdEl.set(qn("w:val"), num_id)
+                numPr.append(ilvl)
+                numPr.append(numIdEl)
+                pPr.append(numPr)
+
     def list(self, token, state):
         ordered = token.get("attrs", {}).get("ordered", False)
         self._list_type_stack.append("number" if ordered else "bullet")
         self._list_level += 1
+        if ordered:
+            self._numid_stack.append(self._new_ordered_num_id(self._list_level))
         children = token.get("children", [])
         for child in children:
             self._render_token(child, state)
         self._list_level -= 1
         self._list_type_stack.pop()
+        if ordered:
+            self._numid_stack.pop()
         return ""
 
     def list_item(self, token, state):
@@ -859,11 +918,13 @@ class DocxRenderer(mistune.BaseRenderer):
                 ct = child.get("type", "")
                 if ct == "block_text":
                     para = self.doc.add_paragraph(style=style)
+                    self._apply_num_id(para)
                     _add_checkbox(para)
                     self._render_inline_to_para(para, child.get("children", []))
                 elif ct == "paragraph":
                     if para is None:
                         para = self.doc.add_paragraph(style=style)
+                        self._apply_num_id(para)
                         _add_checkbox(para)
                         self._render_inline_to_para(para, child.get("children", []))
                     else:
@@ -877,6 +938,7 @@ class DocxRenderer(mistune.BaseRenderer):
             elif isinstance(child, str) and child.strip():
                 if para is None:
                     para = self.doc.add_paragraph(style=style)
+                    self._apply_num_id(para)
                     _add_checkbox(para)
                     apply_inline(para, child)
         return ""
@@ -918,8 +980,11 @@ class DocxRenderer(mistune.BaseRenderer):
         for child in children:
             if isinstance(child, dict):
                 if child.get("type") == "table_head":
-                    for row in child.get("children", []):
-                        head_rows.append(row)
+                    # mistune v3: table_head children are table_cell tokens directly
+                    # (no table_row wrapper). Wrap them in a single virtual row.
+                    cells = child.get("children", [])
+                    if cells:
+                        head_rows.append({"type": "table_row", "children": cells})
                 elif child.get("type") == "table_body":
                     for row in child.get("children", []):
                         body_rows.append(row)
@@ -1695,7 +1760,14 @@ Examples:
     )
     args = parser.parse_args()
 
-    output_dir = Path(args.output) if args.output else None
+    output_dir = None
+    output_file = None
+    if args.output:
+        _out = Path(args.output)
+        if _out.suffix.lower() == ".docx":
+            output_file = _out  # --output aponta para um arquivo .docx específico
+        else:
+            output_dir = _out   # --output aponta para uma pasta (comportamento original)
 
     # ── Single file mode ──────────────────────────────────────────────────────
     if args.file:
@@ -1759,9 +1831,13 @@ Examples:
                 sys.exit(1)
 
             md_path = src_path
-            out_dir = output_dir or md_path.parent
-            out_dir.mkdir(parents=True, exist_ok=True)
-            docx_path = out_dir / (md_path.stem + ".docx")
+            if output_file:
+                docx_path = output_file
+                docx_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                out_dir = output_dir or md_path.parent
+                out_dir.mkdir(parents=True, exist_ok=True)
+                docx_path = out_dir / (md_path.stem + ".docx")
 
             if docx_path.exists() and not args.force:
                 print(f"[PULA]  {md_path.name} → já existe {docx_path.name}")

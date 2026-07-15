@@ -53,7 +53,8 @@ md2docx artigo.pdf                    # Converter PDF → MD
 md2docx README.md -f                  # Forçar sobrescrita
 md2docx "C:\pasta\"                   # Batch — pasta como argumento posicional
 md2docx --folder C:\docs              # Batch — via flag
-md2docx --output C:\saida README.md   # Pasta de saída customizada
+md2docx --output C:\saida README.md          # Pasta de saída customizada
+md2docx README.md --output livro.docx        # Arquivo de saída com nome específico (v3.4+)
 ```
 
 ## Instalar o executável globalmente
@@ -101,8 +102,12 @@ Copiar `dist/md2docx.exe` para uma pasta no PATH do sistema:
 - **Encoding UTF-8**: `sys.stdout.reconfigure(encoding='utf-8')` resolve problema com terminal Windows (cp1252).
 - **Detecção de capa por regex**: `extract_cover()` usa regex para extrair o bloco de capa sem interferir no parser mistune.
 
-## Estado Atual (2026-04-14) — v3.3
+## Estado Atual (2026-07-15) — v3.5
 
+- 🐛 **Correção crítica: listas numeradas cresciam sem reiniciar entre capítulos/seções** (v3.5): cada item de lista numerada usava apenas o estilo Word `"List Number"`, que compartilha uma numeração global — em manuscritos com muitas listas separadas, os números só cresciam (chegando a passar de 100 em vez de reiniciar em 1 a cada lista). Corrigido: cada bloco `<list>` do Markdown agora ganha sua própria instância de numeração (`w:numId` dedicado, apontando para o mesmo `abstractNum` do estilo), então cada lista reinicia em 1 independentemente das outras. Listas aninhadas continuam funcionando normalmente (cada nível de aninhamento recebe seu próprio `numId`).
+- ✅ **`--output` com nome de arquivo** (v3.4): `md2docx arquivo.md --output livro.docx` agora grava diretamente no caminho especificado. Antes criava uma pasta `livro.docx/` com o arquivo dentro; agora detecta extensão `.docx` e trata como arquivo de destino.
+- 🐛 **Correção crítica: itálico e tachado sumiam no MD→DOCX** (v3.4): o mistune 3 usa os tipos de token `emphasis` e `strikethrough` (não `em`/`del` como nas versões antigas). O renderer só tratava `em`/`del`, então texto em *itálico*, ***negrito+itálico*** e ~~tachado~~ era silenciosamente descartado ao gerar o DOCX. Corrigido para aceitar ambos os nomes de token.
+- 🐛 **Correção: cabeçalho de tabela duplicado** (v3.4): no mistune 3, `table_head` já contém as células diretamente (sem `table_row` intermediário); o código antigo tratava cada célula como se fosse uma linha, duplicando o cabeçalho.
 - ✅ **Footnotes com formatação rica** (v3.3): negrito, itálico, tachado, código inline dentro de notas de rodapé — gerados como runs XML reais, sem perda de formatação
 - ✅ **Task lists** (v3.2): `- [x]` → ☑, `- [ ]` → ☐ no DOCX
 - ✅ **Footnotes DOCX nativo** (v3.2): `[^1]` gera `<w:footnoteReference>` + `footnotes.xml` real no pacote
